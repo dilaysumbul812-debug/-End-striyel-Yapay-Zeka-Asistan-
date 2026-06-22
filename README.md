@@ -58,5 +58,5 @@ Uygulama `http://localhost:8080` adresinde çalışmaya başlayacaktır. Tarayı
 
 ## 👨‍💻 Geliştirici
 **Dilay Sümbül** - Elektrik-Elektronik Mühendisi & Yapay Zeka Geliştiricisi  
-* [LinkedIn Profilim](https://linkedin.com/in/LINKEDIN_KULLANICI_ADIN)
-* [GitHub Profilim](https://github.com/KULLANICI_ADIN)
+* [LinkedIn Profilim](linkedin.com/in/dilay-sümbül-3a1961254)
+* [GitHub Profilim](https://github.com/dilaysumbul812-debug)
