@@ -1,0 +1,1227 @@
+# ==========================================================
+# ENDÜSTRİYEL YAPAY ZEKA — RAPOR ARŞİVİ & AI CHATBOT
+# ==========================================================
+from flask import Flask, render_template_string, send_from_directory, request, jsonify
+import os
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta, date
+from collections import defaultdict
+import requests as http_requests
+import json
+import re
+import traceback
+import time
+import urllib.parse
+from sqlalchemy import create_engine
+
+app = Flask(__name__)
+RAPOR_KLASORU = "Raporlar"
+
+# ==========================================================
+# MAKİNE ID → İSİM EŞLEŞTİRME (Anonimleştirilmiş Jenerik İsimler)
+# ==========================================================
+MACHINE_NAME_MAP = {
+    101: "MAKINE-1", 102: "MAKINE-2", 103: "MAKINE-3", 104: "MAKINE-4",
+    105: "MAKINE-5", 106: "MAKINE-6", 107: "MAKINE-7", 108: "MAKINE-8"
+}
+
+# Excel dosya yolları (Dinamik yol, kişisel dizinler temizlendi)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+URETIM_EXCEL = os.path.join(SCRIPT_DIR, "uretim_tablosu.xlsx")
+ARIZA_EXCEL = os.path.join(SCRIPT_DIR, "ariza.xlsx")
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+
+def fetch_data_from_sql_to_excel(uretim_excel, ariza_excel, bitis_tarihi_str):
+    print("\n[BİLGİ] SQL Server'dan son 90 günlük canlı veriler çekiliyor...")
+    
+    # --- SQL BAĞLANTI BİLGİLERİ (Anonimleştirildi) ---
+    db_sunucu = "127.0.0.1" 
+    db_port = "1433"
+    db_kullanici = "db_user"  
+    db_sifre_ham = "db_password"  
+    db_sifre_guvenli = urllib.parse.quote_plus(db_sifre_ham)
+    db_isim = "factory_db"
+    baglanti_url = f"mssql+pyodbc://{db_kullanici}:{db_sifre_guvenli}@{db_sunucu}:{db_port}/{db_isim}?driver=ODBC+Driver+17+for+SQL+Server&Encrypt=yes&TrustServerCertificate=yes"
+    
+    try:
+        engine = create_engine(baglanti_url)
+        # --- DİNAMİK TARİH HESAPLAMASI ---
+        bitis_tarihi = pd.to_datetime(bitis_tarihi_str)
+        baslangic_tarihi = bitis_tarihi - timedelta(days=90)
+        
+        bitis_str = bitis_tarihi.strftime('%Y-%m-%d')
+        baslangic_str = baslangic_tarihi.strftime('%Y-%m-%d')
+        
+        with engine.connect() as connection:
+            query_table = f"SELECT * FROM production_logs WHERE CAST(start_tarih AS DATE) BETWEEN '{baslangic_str}' AND '{bitis_str}'"
+            df_table = pd.read_sql(query_table, con=connection)
+            
+            query_ariza = f"SELECT * FROM error_logs WHERE CAST(ariza_zaman AS DATE) BETWEEN '{baslangic_str}' AND '{bitis_str}'"
+            df_ariza = pd.read_sql(query_ariza, con=connection)
+            
+            if not df_table.empty:
+                df_table.to_excel(uretim_excel, index=False)
+                print(f"✅ ÜRETİM EXCEL DOSYASI GÜNCELLENDİ ({len(df_table)} satır).")
+            if not df_ariza.empty:
+                df_ariza.to_excel(ariza_excel, index=False)
+                print(f"✅ ARIZA EXCEL DOSYASI GÜNCELLENDİ ({len(df_ariza)} satır).")
+                
+    except Exception as e:
+        print("❌ Veritabanı Bağlantı Hatası veya Veri Çekilemedi:")
+        print("⚠️ HATA DETAYI:", str(e).splitlines()[0])
+        print("⚠️ Bilgisayardaki mevcut Excel dosyaları ile analize devam ediliyor...\n")
+
+def get_machine_name(machine_id):
+    try:
+        return MACHINE_NAME_MAP.get(int(machine_id), f"Makine {machine_id}")
+    except (ValueError, TypeError):
+        return str(machine_id)
+
+# ==========================================================
+# CHATBOT MOTORU (RAG-Lite: Deterministik Veri + LLM Format)
+# ==========================================================
+# ==========================================================
+# SİSTEM KİMLİĞİ VE BİLGİSİ
+# ==========================================================
+SYSTEM_IDENTITY = """Sen Akıllı Fabrika'nın yapay zeka üretim asistanısın.
+
+KİMLİĞİN:
+- Adın: Fabrika AI Asistanı
+- Amacın: Fabrika atölyesindeki üretim verilerini, arıza kayıtlarını ve duruş sürelerini analiz ederek kullanıcılara gerçek zamanlı ve geçmişe dönük bilgi sunmak.
+- Veri Kaynakların: uretim_tablosu.xlsx (üretim kayıtları) ve ariza.xlsx (arıza/alarm kayıtları)
+- Çalışma Ortamı: Yerel sunucu (intranet), internet bağlantısı gerektirmez
+- Oluşturulma Amacı: Kestirimci bakım, üretim optimizasyonu ve performans takibi
+
+YAPABİLECEKLERİN:
+- Makine bazlı üretim performansı analizi
+- Arıza/alarm dağılımı ve trend analizi
+- Makine karşılaştırması
+- Duruş süresi analizi (makine kaynaklı vs operatör kaynaklı)
+- Günlük/haftalık/aylık üretim özetleri
+- En verimli/verimsiz gün ve makine tespiti
+- Mikro duruş (Chokotei) analizi
+- Arıza/Alarm tespiti yapıldığında, bağlamdaki [ARIZA ÇÖZÜM HAVUZU] bilgisini kullanarak anında günlük ve haftalık müdahale tavsiyesi sunmak. Bir alarmdan bahsediyorsan ve çözüm havuzunda o alarma ait tavsiye varsa, bunu MUTLAKA yanıtına ekle.
+
+MAKİNELER:
+MAKINE-1 (ID:101), MAKINE-2 (ID:102), MAKINE-3 (ID:103), MAKINE-4 (ID:104),
+MAKINE-5 (ID:105), MAKINE-6 (ID:106), MAKINE-7 (ID:107), MAKINE-8 (ID:108)"""
+
+# Şirket spesifik terimlerden (İp kopması, çektirme vs.) arındırılmış Jenerik Çözüm Havuzu
+COZUM_HAVUZU = {
+    "MALZEME_KOPMASI": {
+        "Gunluk": [
+            "{lokasyon} numaralı malzeme yolundaki birikim temizlenmeli ve kılavuzlar kontrol edilmelidir.",
+            "{lokasyon} noktasındaki gerginlik/tansiyon ayarı operatör tarafından gözden geçirilmelidir.",
+            "{lokasyon} kısmındaki besleme kalitesi ve hızı anlık olarak izlenmelidir."
+        ],
+        "Haftalik": [
+            "{lokasyon} spesifik konumunda kronikleşen hatalar için, bu hattın temas yüzeyleri değiştirilmelidir.",
+            "{lokasyon} ünitesinin ağırlıkları, yay mekanizması ve frenleme sistemi detaylı bakıma alınmalıdır."
+        ]
+    },
+    "KONVEYOR_SARIM": {
+        "Gunluk": [
+            "{lokasyon} aktarma grubundaki merdanelerin (galet) yüzey kirliliği kontrol edilmelidir.",
+            "{lokasyon} bölgesindeki pnömatik aktarma tabancasının hava basıncı anlık olarak ölçülmelidir.",
+            "{lokasyon} sarım/toplama kafasındaki yakalama mekanizmasının mekanik serbestliği test edilmelidir."
+        ],
+        "Haftalik": [
+            "{lokasyon} ünitesindeki rulmanlarda veya motorlarda aşınma tespiti için termal kontrol yapılmalıdır.",
+            "Kronikleşen {lokasyon} hataları için aktarma valfleri ve hava hortumları yenilenmelidir."
+        ]
+    },
+    "SENSÖR": {
+        "Gunluk": [
+            "Vardiya amiri tarafından {lokasyon} sensörünün dijital ekranı kontrol edilmeli; anlık okuma değeri ile ayarlanan 'SET' eşiği arasındaki farkın (marjın) yeterli olup olmadığına bakılmalıdır.",
+            "{lokasyon} konumundaki sensörün lens yüzeyi ortamdaki toz veya partiküllere karşı kuru ve yumuşak bir bezle silinmelidir.",
+            "Hedef malzemenin tonu veya parlaklığı değişmiş olabilir; {lokasyon} sensörü üzerinden hızlı yeniden öğretme (Auto-Tune) yapılmalıdır.",
+            "{lokasyon} sensörünün bağlandığı brakette titreşim kaynaklı gevşeme olup olmadığı kontrol edilmelidir."
+        ],
+        "Haftalik": [
+            "Kronik okuma hatalarına karşı, {lokasyon} sensörünün odak noktasının malzemedeki dalgalanmalardan etkilenip etkilenmediği incelenmeli.",
+            "Titreşim kaynaklı odak kayıplarını önlemek için montaj braketi sıkılmalıdır.",
+            "{lokasyon} konumundaki sensörün soketinde ve sinyal kablosunda sıvı teması, oksitlenme kontrolü yapılmalıdır."
+        ]
+    },
+    "SIKISMA_TAKILMA": {
+        "Gunluk": [
+            "{lokasyon} bölgesindeki kesim/işlem bıçağının ısısı ve fiziksel pürüzler kontrol edilmelidir.",
+            "İşlem yüzeyi, aşınma ve hassasiyet kaybı açısından detaylı muayene edilmelidir.",
+            "Mekanizmada biriken endüstriyel toz ve çapaklar performansı düşürür; basınçlı hava ile temizlenmelidir."
+        ],
+        "Haftalik": [
+            "İşlem bıçakları/ekipmanları ömrünü doldurmuş olabilir. Rutin değişim (revizyon) planlanmalıdır."
+        ]
+    },
+    "ROBOTIC_GRIPPER": {
+        "Gunluk": [
+            "{lokasyon} gripper pistonunu ileri itmesi gereken pnömatik hattın çalışma basıncı ve valf tepkisi anlık olarak gözlemlenmelidir.",
+            "{lokasyon} bölgesindeki mekanizmayı sıkıştıran fiziksel bir engel (çapak/malzeme birikimi) olup olmadığı kontrol edilmelidir.",
+            "{lokasyon} 'geride' sensörünün (limit switch) üzeri temizlenmeli ve test edilmelidir."
+        ],
+        "Haftalik": [
+            "{lokasyon} ünitesinin lineer kızak ve arabalarında mekanik aşınma veya yağsızlık kaynaklı kasılma kontrolü yapılmalıdır.",
+            "Sürekli tekrarlayan alarm için {lokasyon} sensör braketinin kalibrasyonu yenilenmelidir.",
+            "{lokasyon} gripper silindirinin iç keçelerinde hava kaçağı test edilmeli, gerekirse pnömatik revizyon planlanmalıdır."
+        ]
+    },
+    "VALF_PNÖMATİK": {
+        "Gunluk": [
+            "{lokasyon} bölgesindeki pnömatik valf adasında hava kaçağı veya hortum gevşemesi olup olmadığı dinlenmelidir.",
+            "{lokasyon} pistonunun strok mesafesini engelleyen fiziksel bir kirlilik/sıkışma olup olmadığı kontrol edilmelidir."
+        ],
+        "Haftalik": [
+            "{lokasyon} pnömatik hattındaki şartlandırıcılar kontrol edilmeli, sistemdeki su/yağ birikimi tahliye edilmelidir.",
+            "Sıkışma yapan {lokasyon} valf bloğu veya piston contaları ömrünü doldurduğu için revizyona alınmalıdır."
+        ]
+    },
+    "MOTOR_SÜRÜCÜ": {
+        "Gunluk": [
+            "{lokasyon} motor sürücüsünün (invertör) verdiği hata kodu not edilmeli ve soğutma fanı temizlenmelidir.",
+            "{lokasyon} motorundaki termik atma durumuna karşı mekanik bir zorlanma/sıkışma olup olmadığı elle kontrol edilmelidir."
+        ],
+        "Haftalik": [
+            "{lokasyon} motorunun çektiği akım grafikleri otomasyon üzerinden incelenmeli, izolasyon testi yapılmalıdır.",
+            "{lokasyon} sürücüsünün parametreleri kontrol edilmeli, gerekirse redüktör grubunda yağ analizi yapılmalıdır."
+        ]
+    },
+    "MEKANİK": {
+        "Gunluk": [
+            "{lokasyon} mekanik grubunda olağandışı bir sürtünme sesi veya vibrasyon olup olmadığı dinlenmelidir.",
+            "{lokasyon} aksamındaki hareketli parçaların günlük yağlama/gresleme prosedürü uygulanmalıdır."
+        ],
+        "Haftalik": [
+            "{lokasyon} bölgesindeki aktarma organlarında (kayış, kasnak, rulman) boşluk/aşınma kontrolü yapılmalıdır.",
+            "Mekanik yorulmanın yüksek olduğu {lokasyon} ünitesinde kestirimci bakım (titreşim analizi) uygulanmalıdır."
+        ]
+    },
+    "GENEL": {
+        "Gunluk": [
+            "{lokasyon} bölgesinde bildirilen bu hata için vardiya amiri tarafından yerinde saha gözlemi yapılmalıdır.",
+            "{lokasyon} spesifik arızası için operatörden olayın nasıl gerçekleştiğine dair kök neden bilgisi alınmalıdır."
+        ],
+        "Haftalik": [
+            "{lokasyon} bölgesindeki bu tekrarlayan sorun için Bakım ve Üretim ekipleri ortak bir Kök Neden (5-Neden) analizi başlatmalıdır.",
+            "Bu spesifik {lokasyon} arızası kronikleşme eğiliminde olduğu için makine üreticisi dökümanları incelenmelidir."
+        ]
+    }
+}
+
+# ==========================================================
+# ROTA BAZLI PROMPT KURALLARI (Semantic Router)
+# ==========================================================
+ROUTE_RULES = {
+    "ARIZA": """1. SADECE arıza/alarm verilerini kullan. Üretim adetleri veya makine üretim sıralamasıyla ASLA ilgilenme.
+2. "En çok alınan alarm" sorulduğunda listenin 1. sırasındaki alarmın ADINI yaz.
+3. Her alarmın yanındaki [En çok: MAKINE-X] bilgisi o alarmın en çok yaşandığı makinedir. "Hangi makinede" sorusuna SADECE bu bilgiyi kullan.
+4. Arızanın yanında (Tavsiye: ...) yazıyorsa bunu da cevaba ekle.
+5. Veride yoksa "Bu bilgi elimde yok" de, sayı veya isim uydurma.""",
+
+    "SIPARIS": """1. SADECE sipariş/barkod detayını kullan.
+2. Kalite, tamir ve personel dağılımını detaylı sun.
+3. "Hangi operatör" sorusuna kişi adıyla yanıt ver.
+4. Veride yoksa "Bu bilgi elimde yok" de, sayı veya isim uydurma.""",
+
+    "MAKINE": """1. Sorulan makine hakkında detaylı bilgi ver.
+2. Üretim, çevrim süresi, operatör disiplini, arızalar ve duruş süresi bilgilerini dahil et.
+3. "En çok üretim yapan makine" sorulduğunda "En İyi Makine:" satırına bak.
+4. Kısa, net ve kesin konuş.
+5. Veride yoksa "Bu bilgi elimde yok" de, sayı veya isim uydurma.""",
+
+    "PERSONEL": """1. SADECE personel/operatör verilerini kullan.
+2. En fazla 2.kalite, tamir veya geç başlama/erken bırakma bilgilerini doğru oku.
+3. Matematiksel olarak en büyük sayıya sahip olan kişiyi söyle.
+4. Veride yoksa "Bu bilgi elimde yok" de, sayı veya isim uydurma.""",
+
+    "GENEL": """1. SADECE <data_context> etiketleri içindeki verileri kullan.
+2. Veride yoksa "Bu bilgi elimde yok" de, kesinlikle sayı veya isim uydurma.
+3. Kendi kendine matematiksel işlem yapma, değerler bağlamda zaten verilmiştir.
+4. "Hangi makine" sorusuna MAKINE-X olarak, "Hangi operatör" sorusuna kişi adıyla yanıt ver. 
+5. Kısa, net ve kesin konuş. Listeler için madde işareti kullan.
+6. Asla "Veri bağlamına göre" veya "Sütununa bakıldığında" gibi kalıplar kullanma. Doğrudan cevabı ver.
+7. Eğer kullanıcı genel bir makine performansı özeti istiyorsa; cevabına "Değerlendirilen Tarih Aralığı" ile başla ve özetle.
+8. "En çok üretim yapan makine", "en verimli makine" gibi sorularda SADECE "[MAKİNE BAZLI ÜRETİM (Sıralı)]" başlığı altındaki "En İyi Makine:" satırına bak."""
+}
+
+class ChatbotEngine:
+    def __init__(self):
+        self.uretim = None
+        self.ariza = None
+        
+        self._chat_history = []
+        self._last_period = 30  
+        self._last_machine = None
+        self._last_barcode = None
+        self._last_route = None    
+        self._last_alarm = None    
+        
+        self._load_data()
+
+    def _load_data(self):
+        try:
+            u_path = URETIM_EXCEL 
+            a_path = ARIZA_EXCEL 
+            
+            if not os.path.exists(u_path) or not os.path.exists(a_path):
+                # Dosya yoksa boş dataframe oluştur ki sistem çökmesin
+                self.uretim = pd.DataFrame()
+                self.ariza = pd.DataFrame()
+                self._last_load_time = time.time()
+                return
+
+            uretim = pd.read_excel(u_path)
+            ariza = pd.read_excel(a_path)
+
+            # Sütun isim standardizasyonu
+            uretim.rename(columns={'makine_kimlik': 'Makinekimlik', 'basladi_tarih': 'Basladi_tarih'}, inplace=True)
+            ariza.rename(columns={'makine_kimlik': 'Makinekimlik'}, inplace=True)
+
+            gecerli = [str(k) for k in MACHINE_NAME_MAP.keys()]
+            uretim = uretim[uretim['Makinekimlik'].astype(str).str.replace('.0','',regex=False).isin(gecerli)]
+            ariza  = ariza[ariza['Makinekimlik'].astype(str).str.replace('.0','',regex=False).isin(gecerli)]
+            uretim['Makinekimlik'] = uretim['Makinekimlik'].astype(str).str.replace('.0','',regex=False).astype(int)
+            ariza['Makinekimlik']  = ariza['Makinekimlik'].astype(str).str.replace('.0','',regex=False).astype(int)
+
+            cols_to_keep = ['ID','Basladi_tarih','start_tarih','stop_tarih','uretimadet','Makinekimlik','uretim_sure_sn',
+                            'siparis_no', 'etiket', 'personel', 'birinci_kalite', 'ikinci_kalite', 'tamir']
+            existing_cols = [c for c in cols_to_keep if c in uretim.columns]
+            uretim = uretim[existing_cols]
+
+            rename_map = {'ID': 'id', 'Basladi_tarih': 'basladi', 'start_tarih': 'start', 'stop_tarih': 'stop', 'uretim_sure_sn': 'sure'}
+            uretim.rename(columns=rename_map, inplace=True)
+            ariza = ariza[['id','ariza_zaman','ariza_aciklama','Makinekimlik']]
+            ariza.columns = ['id','ariza_zaman','aciklama','Makinekimlik']
+
+            uretim['start'] = pd.to_datetime(uretim['start'])
+            uretim['stop']  = pd.to_datetime(uretim['stop'])
+            ariza['ariza_zaman'] = pd.to_datetime(ariza['ariza_zaman'])
+            uretim['date'] = uretim['start'].dt.date
+            ariza['date']  = ariza['ariza_zaman'].dt.date
+
+            uretim = uretim.sort_values(['Makinekimlik', 'start'])
+            uretim['onceki_stop'] = uretim.groupby(['date', 'Makinekimlik'])['stop'].shift(1)
+            uretim['mudahale_suresi_sn'] = (uretim['start'] - uretim['onceki_stop']).dt.total_seconds()
+            uretim['mudahale_suresi_sn'] = uretim['mudahale_suresi_sn'].apply(lambda x: x if pd.notnull(x) and 0 <= x <= 3600 else 0)
+
+            a_sorted = ariza.sort_values('ariza_zaman').copy()
+            u_sorted = uretim.sort_values('start').copy()
+            merged = pd.merge_asof(
+                u_sorted, 
+                a_sorted[['ariza_zaman', 'Makinekimlik']], 
+                left_on='start', 
+                right_on='ariza_zaman', 
+                by='Makinekimlik',
+                direction='backward'
+            )
+            merged['durus_tipi'] = 'Operatör'
+            mask = (merged['ariza_zaman'] >= merged['onceki_stop']) & (merged['ariza_zaman'] <= merged['start'])
+            merged.loc[mask, 'durus_tipi'] = 'Makine'
+            uretim = merged
+
+            # Bakım testi temizliği (Genel 17:00 mesai sonu)
+            import datetime as dt_mod
+            sinir = dt_mod.time(17, 0)
+            sil_u, sil_a = [], []
+            for gun in uretim['start'].dt.date.unique():
+                gu = uretim[uretim['start'].dt.date == gun]
+                ms = gu[gu['start'].dt.time > sinir]
+                if not ms.empty and len(ms['Makinekimlik'].unique()) < 6:
+                    sil_u.extend(ms.index.tolist())
+                    ga = ariza[ariza['ariza_zaman'].dt.date == gun]
+                    ma = ga[(ga['ariza_zaman'].dt.time > sinir) & (ga['Makinekimlik'].isin(ms['Makinekimlik'].unique()))]
+                    sil_a.extend(ma.index.tolist())
+            uretim = uretim.drop(sil_u)
+            ariza  = ariza.drop(sil_a)
+
+            self.uretim = uretim
+            self.ariza  = ariza
+            self._last_load_time = time.time()
+            print(f"✅ Chatbot verisi yüklendi — Üretim: {len(uretim)} satır, Arıza: {len(ariza)} satır")
+        except Exception as e:
+            print(f"❌ Chatbot veri yükleme hatası: {e}")
+            traceback.print_exc()
+
+    def _ensure_fresh(self):
+        if self._last_load_time is None or (time.time() - self._last_load_time) > 3600:
+            self._load_data()
+
+    def _resolve_machines(self, text):
+        machines = []
+        # Jenerik makine formatı tespiti (MAKINE-1, MAKİNE 1 vs)
+        matches = re.finditer(r'[Mm][Aa][Kk][İiIi][Nn][Ee]\s*[-–]?\s*(\d+)', text)
+        for m in matches:
+            tid = 100 + int(m.group(1)) # ID mapping'e uygun hale getir
+            if tid in MACHINE_NAME_MAP and tid not in machines:
+                machines.append(tid)
+        
+        # Nolu/Numaralı makine
+        matches_num = re.finditer(r'(\d+)\s*(?:nolu|numaralı|\.?\s*makine)', text.lower())
+        for m in matches_num:
+            tid = 100 + int(m.group(1))
+            if tid in MACHINE_NAME_MAP and tid not in machines:
+                machines.append(tid)
+        return machines
+
+    def _resolve_machine(self, text):
+        m = self._resolve_machines(text)
+        if m:
+            self._last_machine = m[0]
+            return m[0]
+        
+        takip_kelimeleri = {r"\bbu makine\b", r"\bonun\b", r"\bbunun\b", r"\bpeki\b", r"\baynı makine\b", r"\bo makine\b", r"\bbu makinenin\b"}
+        if self._last_machine and any(re.search(w, text.lower()) for w in takip_kelimeleri):
+            return self._last_machine
+        return None
+
+    def _resolve_barcode(self, text):
+        match = re.search(r'S?\d+_\d+(?:\s+[A-Z]\d+-\d+)?', text)
+        if match: return match.group(0)
+        return None
+
+    def _resolve_period(self, text):
+        t = text.lower()
+        date_pattern = r'(\d{1,2})[\./-](\d{1,2})[\./-](\d{4})'
+        date_range = re.findall(f'{date_pattern}\\s*(?:-|ile|ve|\\s+)\\s*{date_pattern}', t)
+        if date_range:
+            try:
+                start_d, start_m, start_y = int(date_range[0][0]), int(date_range[0][1]), int(date_range[0][2])
+                end_d, end_m, end_y = int(date_range[0][3]), int(date_range[0][4]), int(date_range[0][5])
+                start_date = date(start_y, start_m, start_d)
+                end_date = date(end_y, end_m, end_d)
+                if start_date > end_date: start_date, end_date = end_date, start_date
+                return {"type": "range", "start": start_date, "end": end_date}
+            except: pass
+        else:
+            single_date = re.search(date_pattern, t)
+            if single_date:
+                try:
+                    d, m, y = int(single_date.group(1)), int(single_date.group(2)), int(single_date.group(3))
+                    dt = date(y, m, d)
+                    return {"type": "range", "start": dt, "end": dt}
+                except: pass
+        
+        aylar = {"ocak": 1, "şubat": 2, "mart": 3, "nisan": 4, "mayıs": 5, "haziran": 6, "temmuz": 7, "ağustos": 8, "eylül": 9, "ekim": 10, "kasım": 11, "aralık": 12}
+        for ay_ad, ay_no in aylar.items():
+            if ay_ad in t and "ay" in t: return {"type": "specific_month", "month": ay_no}
+            
+        if any(w in t for w in ["tüm zaman","şu ana kadar","tüm veri","toplam veri"]): return {"type": "all"}
+        
+        def word_to_num(w):
+            words = {"bir":1, "iki":2, "üç":3, "dört":4, "beş":5, "altı":6, "yedi":7, "sekiz":8, "dokuz":9, "on":10}
+            return words.get(w, 1)
+
+        num_p = r'(\d+|bir|iki|üç|dört|beş|altı|yedi|sekiz|dokuz|on)'
+        
+        if "bu ay" in t: return {"type": "this_month"}
+        if any(w in t for w in ["geçen ay", "geçtiğimiz ay"]): return {"type": "last_month"}
+        if any(w in t for w in ["bu hafta"]): return {"type": "this_week"}
+        if any(w in t for w in ["geçen hafta", "geçtiğimiz hafta"]): return {"type": "last_week"}
+        if "bugün" in t: return {"type": "today"}
+        if "dün" in t: return {"type": "yesterday"}
+        
+        m = re.search(f'son\\s*{num_p}\\s*ay', t)
+        if m: return {"type": "days", "days": (int(m.group(1)) if m.group(1).isdigit() else word_to_num(m.group(1))) * 30}
+            
+        m = re.search(f'son\\s*{num_p}\\s*hafta', t)
+        if m: return {"type": "days", "days": (int(m.group(1)) if m.group(1).isdigit() else word_to_num(m.group(1))) * 7}
+            
+        m = re.search(f'son\\s*{num_p}\\s*gün', t)
+        if m: return {"type": "days", "days": (int(m.group(1)) if m.group(1).isdigit() else word_to_num(m.group(1)))}
+            
+        return self._last_period if self._last_period else {"type": "days", "days": 30}
+
+    def _get_period_text(self, period):
+        if not isinstance(period, dict): return "Seçilen Dönem"
+        if period.get("type") == "days": return f"Son {period.get('days', 30)} Gün"
+        if period.get("type") == "range": return f"{period['start'].strftime('%d.%m.%Y')} - {period['end'].strftime('%d.%m.%Y')} Dönemi"
+        if period.get("type") == "specific_month":
+            aylar_tr = {1:"Ocak",2:"Şubat",3:"Mart",4:"Nisan",5:"Mayıs",6:"Haziran",7:"Temmuz",8:"Ağustos",9:"Eylül",10:"Ekim",11:"Kasım",12:"Aralık"}
+            return f"{aylar_tr.get(period['month'], '')} Ayı"
+        if period.get("type") == "yesterday": return "Dün"
+        if period.get("type") == "today": return "Bugün"
+        if period.get("type") == "this_month": return "Bu Ay"
+        if period.get("type") == "last_month": return "Geçen Ay"
+        if period.get("type") == "this_week": return "Bu Hafta"
+        if period.get("type") == "last_week": return "Geçen Hafta"
+        if period.get("type") == "all": return "Tüm Zamanlar"
+        return "Seçilen Dönem"
+
+    def _filter(self, df, period):
+        if df is None or df.empty or period is None: return df
+        today = datetime.now().date()
+        if not isinstance(period, dict): return df
+        if period["type"] == "all": return df
+        if period["type"] == "this_month": return df[df['date'].apply(lambda x: x.month == today.month and x.year == today.year)]
+        if period["type"] == "specific_month":
+            y = today.year
+            if period["month"] > today.month: y -= 1
+            return df[df['date'].apply(lambda x: x.month == period["month"] and x.year == y)]
+        if period["type"] == "range": return df[(df['date'] >= period["start"]) & (df['date'] <= period["end"])]
+        if period["type"] == "today": return df[df['date'] == today]
+        if period["type"] == "yesterday": return df[df['date'] == today - timedelta(days=1)]
+        if period["type"] == "this_week":
+            start = today - timedelta(days=today.weekday())
+            return df[(df['date'] >= start) & (df['date'] <= today)]
+        if period["type"] == "last_week":
+            start = today - timedelta(days=today.weekday() + 7)
+            end = start + timedelta(days=6)
+            return df[(df['date'] >= start) & (df['date'] <= end)]
+        if period["type"] == "last_month":
+            first_day = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
+            last_day = today.replace(day=1) - timedelta(days=1)
+            return df[(df['date'] >= first_day) & (df['date'] <= last_day)]
+        
+        start = today - timedelta(days=period.get("days", 30))
+        return df[(df['date'] >= start) & (df['date'] <= today)]
+
+    def _daily_prod(self, u):
+        if u.empty: return pd.DataFrame(columns=['date','Makinekimlik','uretim'])
+        u = u.copy()
+        u['uretimadet_num'] = pd.to_numeric(u['uretimadet'], errors='coerce').fillna(0)
+        r = u.groupby(['date', 'Makinekimlik'])['uretimadet_num'].sum().reset_index()
+        r.rename(columns={'uretimadet_num': 'uretim'}, inplace=True)
+        return r[['date', 'Makinekimlik', 'uretim']]
+
+    def _build_data_context(self, period, makine_id=None, barcode=None):
+        u = self._filter(self.uretim.copy() if self.uretim is not None else pd.DataFrame(), period)
+        a = self._filter(self.ariza.copy() if self.ariza is not None else pd.DataFrame(), period)
+        p_text = self._get_period_text(period)
+        
+        if u.empty: return f"Sorgulanan Dönem: {p_text}\nBu dönemde üretim verisi bulunmamaktadır."
+        
+        dp = self._daily_prod(u)
+        ctx = f"=== VERİ BAĞLAMI ===\nAnaliz Dönemi: {p_text}\n\n"
+        
+        # ── 1. GENEL ÜRETİM ──
+        dt = dp.groupby('date')['uretim'].sum().reset_index()
+        mt = dp.groupby('Makinekimlik')['uretim'].sum()
+        toplam = int(dt['uretim'].sum())
+        ort_gunluk = int(dt['uretim'].mean())
+        aktif_gun = len(dt)
+        aktif_makine = len(mt)
+        
+        from datetime import date
+        bugun = date.today()
+        dt_tamamlanmis = dt[dt['date'] != bugun] if len(dt[dt['date'] != bugun]) > 0 else dt
+        en_iyi_gun = dt_tamamlanmis.loc[dt_tamamlanmis['uretim'].idxmax()]
+        en_kotu_gun = dt_tamamlanmis.loc[dt_tamamlanmis['uretim'].idxmin()]
+        
+        genel_trend = "STABİL"
+        if len(dt) > 1:
+            dt_sorted = dt.sort_values('date')
+            gyari = len(dt_sorted) // 2
+            g_ilk = dt_sorted.head(max(gyari, 1))['uretim'].mean()
+            g_son = dt_sorted.tail(max(gyari, 1))['uretim'].mean()
+            if g_son > g_ilk * 1.1: genel_trend = "ARTIYOR (İyileşme)"
+            elif g_son < g_ilk * 0.9: genel_trend = "AZALIYOR (İstikrarsızlık)"
+            else: genel_trend = "STABİL (İstikrarlı)"
+        
+        ctx += f"[GENEL ÜRETİM]\n"
+        ctx += f"Değerlendirilen Tarih Aralığı: {u['date'].min().strftime('%d.%m.%Y')} - {u['date'].max().strftime('%d.%m.%Y')}\n"
+        ctx += f"Aktif İş Günü: {aktif_gun}\n"
+        ctx += f"Çalışan Makine Sayısı: {aktif_makine}\n"
+        ctx += f"Toplam Üretim: {toplam} adet\n"
+        ctx += f"Günlük Ortalama: {ort_gunluk} adet/gün\n"
+        ctx += f"Üretim İstikrarı / Trendi: {genel_trend}\n"
+        ctx += f"En Verimli Gün: {en_iyi_gun['date']} ({int(en_iyi_gun['uretim'])} adet)\n"
+        ctx += f"En Düşük Gün: {en_kotu_gun['date']} ({int(en_kotu_gun['uretim'])} adet)\n\n"
+        
+        ctx += f"[GÜNLÜK ÜRETİM VE ARIZA ÖZETİ]\n"
+        da = a.groupby(['date', 'Makinekimlik']).size().reset_index(name='ariza_sayisi')
+        for d in sorted(dt['date']):
+            d_str = str(d)
+            gun_toplam = int(dt[dt['date'] == d]['uretim'].iloc[0])
+            gun_makineler = dp[dp['date'] == d]
+            gun_arizalar = da[da['date'] == d]
+            ariza_str = ""
+            if not gun_arizalar.empty:
+                en_cok_ariza_m = gun_arizalar.loc[gun_arizalar['ariza_sayisi'].idxmax()]
+                ariza_str = f" | En Çok Arıza: {get_machine_name(en_cok_ariza_m['Makinekimlik'])} ({int(en_cok_ariza_m['ariza_sayisi'])} kez)"
+            if not gun_makineler.empty:
+                best_m = gun_makineler.loc[gun_makineler['uretim'].idxmax()]
+                worst_m = gun_makineler.loc[gun_makineler['uretim'].idxmin()]
+                best_op_str = worst_op_str = ""
+                if 'personel' in u.columns:
+                    b_ops = [str(p) for p in u[(u['date']==d) & (u['Makinekimlik']==best_m['Makinekimlik'])]['personel'].dropna().unique() if str(p).strip()]
+                    w_ops = [str(p) for p in u[(u['date']==d) & (u['Makinekimlik']==worst_m['Makinekimlik'])]['personel'].dropna().unique() if str(p).strip()]
+                    if b_ops: best_op_str = f" Op:{','.join(b_ops)}"
+                    if w_ops: worst_op_str = f" Op:{','.join(w_ops)}"
+                ctx += f"{d_str}: Üretim {gun_toplam} adet (En Yüksek: {get_machine_name(best_m['Makinekimlik'])} {int(best_m['uretim'])}{best_op_str} | En Düşük: {get_machine_name(worst_m['Makinekimlik'])} {int(worst_m['uretim'])}{worst_op_str}{ariza_str})\n"
+            else:
+                ctx += f"{d_str}: Üretim {gun_toplam} adet{ariza_str}\n"
+        ctx += "\n"
+        
+        ctx += f"[MAKİNE BAZLI ÜRETİM (Sıralı)]\n"
+        for mid, ur in mt.sort_values(ascending=False).items():
+            ctx += f"  {get_machine_name(mid)}: {int(ur)} adet\n"
+        ctx += f"En İyi Makine: {get_machine_name(mt.idxmax())} ({int(mt.max())} adet)\n"
+        ctx += f"En Kötü Makine: {get_machine_name(mt.idxmin())} ({int(mt.min())} adet)\n\n"
+        
+        t_ariza = len(a)
+        ctx += f"[ARIZA / ALARM BİLGİLERİ]\n"
+        ctx += f"Toplam Arıza Sayısı: {t_ariza}\n"
+        ctx += f"Günlük Ortalama Arıza: {round(t_ariza/max(aktif_gun,1),1)}\n"
+        if not a.empty:
+            af = a['aciklama'].value_counts().head(10)
+            ctx += f"En Sık Yaşanan Alarm/Arıza Türleri:\n"
+            for k, (alarm, sayi) in enumerate(af.items()):
+                tavsiye_str = ""
+                if k == 0:
+                    alarm_lower = alarm.lower()
+                    if "koptu" in alarm_lower or "kopma" in alarm_lower: kategori = "MALZEME_KOPMASI"
+                    elif "çek" in alarm_lower or "sarım" in alarm_lower: kategori = "KONVEYOR_SARIM"
+                    elif "sensör" in alarm_lower or "sensor" in alarm_lower: kategori = "SENSÖR"
+                    elif "takıldı" in alarm_lower or "kesim" in alarm_lower: kategori = "SIKISMA_TAKILMA"
+                    elif "gripper" in alarm_lower or "çekme" in alarm_lower: kategori = "ROBOTIC_GRIPPER"
+                    elif "valf" in alarm_lower or "hava" in alarm_lower or "pnömatik" in alarm_lower: kategori = "VALF_PNÖMATİK"
+                    elif "motor" in alarm_lower or "sürücü" in alarm_lower: kategori = "MOTOR_SÜRÜCÜ"
+                    elif "mekanik" in alarm_lower or "sıkışma" in alarm_lower or "sürtünme" in alarm_lower: kategori = "MEKANİK"
+                    else: kategori = "GENEL"
+                        
+                    tavsiyeler = COZUM_HAVUZU.get(kategori, {}).get("Gunluk", [])
+                    if tavsiyeler:
+                        match = re.search(r'\b(SAĞ|SOL|ÜST|ALT|BÖLGE|HAT|NO)\b\s*([A-Z0-9]+)?\s*([0-9]+)?', str(alarm).upper())
+                        if match:
+                            lokasyon_str = match.group(0).strip()
+                            tavsiye_text = " | ".join([t.replace("{lokasyon}", lokasyon_str) for t in tavsiyeler])
+                        else:
+                            tavsiye_text = " | ".join([t.replace("{lokasyon} ", "").replace("{lokasyon}", "").capitalize() for t in tavsiyeler])
+                        tavsiye_str = f" (Tavsiye: {tavsiye_text})"
+                
+                alarm_makineler = a[a['aciklama'] == alarm].groupby('Makinekimlik')['id'].count().sort_values(ascending=False)
+                top_m_str = ""
+                if not alarm_makineler.empty:
+                    top_m_str = f" [En çok: {get_machine_name(alarm_makineler.index[0])}]"
+                ctx += f"  {k+1}. '{alarm}': {sayi} kez (%{round(sayi/t_ariza*100,1)}){top_m_str}{tavsiye_str}\n"
+            
+            ma = a.groupby('Makinekimlik')['id'].count().sort_values(ascending=False)
+            ctx += f"Makine Bazlı Arıza Dağılımı:\n"
+            for m_id, s in ma.items():
+                ctx += f"  {get_machine_name(m_id)}: {s} arıza\n"
+        ctx += "\n"
+        
+        bekleme = u.groupby('Makinekimlik')['mudahale_suresi_sn'].sum().reset_index()
+        bekleme['mudahale_dk'] = bekleme['mudahale_suresi_sn'] / 60
+        ctx += f"[DURUŞ ANALİZİ (Toplam Bekleme Süreleri)]\n"
+        for _, r in bekleme.sort_values('mudahale_dk', ascending=False).iterrows():
+            mak_sn = u[(u['Makinekimlik']==r['Makinekimlik']) & (u['durus_tipi']=='Makine')]['mudahale_suresi_sn'].sum()
+            op_sn = u[(u['Makinekimlik']==r['Makinekimlik']) & (u['durus_tipi']=='Operatör')]['mudahale_suresi_sn'].sum()
+            ctx += f"  {get_machine_name(int(r['Makinekimlik']))}: {int(r['mudahale_dk'])} dk toplam (Makine: {int(mak_sn/60)} dk, Operatör: {int(op_sn/60)} dk)\n"
+        ctx += "\n"
+        
+        if not a.empty:
+            ga = a.groupby('date')['id'].count().reset_index().rename(columns={'id':'sayi'}).sort_values('date')
+            yari = len(ga) // 2
+            ilk = ga.head(max(yari,1))['sayi'].mean()
+            son = ga.tail(max(yari,1))['sayi'].mean()
+            trend = "ARTIŞ" if son > ilk else ("AZALIŞ" if son < ilk else "STABİL")
+            ctx += f"[ARIZA TRENDİ]\nGenel Yön: {trend}\nİlk Yarı Ortalaması: {round(ilk,1)} arıza/gün\nSon Yarı Ortalaması: {round(son,1)} arıza/gün\n\n"
+            
+        if 'personel' in u.columns and 'ikinci_kalite' in u.columns and 'tamir' in u.columns:
+            u_kalite = u.copy()
+            u_kalite['ikinci_kalite_num'] = pd.to_numeric(u_kalite['ikinci_kalite'], errors='coerce').fillna(0)
+            u_kalite['tamir_num'] = pd.to_numeric(u_kalite['tamir'], errors='coerce').fillna(0)
+            p_ikinci = u_kalite.groupby('personel')['ikinci_kalite_num'].sum().sort_values(ascending=False)
+            p_ikinci = p_ikinci[p_ikinci > 0]
+            p_tamir = u_kalite.groupby('personel')['tamir_num'].sum().sort_values(ascending=False)
+            p_tamir = p_tamir[p_tamir > 0]
+            if not p_ikinci.empty or not p_tamir.empty:
+                ctx += f"[PERSONEL / OPERATÖR PERFORMANSI]\n"
+                if not p_ikinci.empty:
+                    ctx += f"En Fazla 2. Kalite Ürün Çıkaran Operatörler:\n"
+                    for p, val in p_ikinci.head(5).items():
+                        if str(p).strip(): ctx += f"  {p}: {int(val)} adet\n"
+                if not p_tamir.empty:
+                    ctx += f"En Fazla Tamir Yapan Operatörler:\n"
+                    for p, val in p_tamir.head(5).items():
+                        if str(p).strip(): ctx += f"  {p}: {int(val)} adet\n"
+                ctx += "\n"
+        
+        if makine_id:
+            u_m = u[u['Makinekimlik'] == makine_id]
+            a_m = a[a['Makinekimlik'] == makine_id] if not a.empty else a
+            isim = get_machine_name(makine_id)
+            if not u_m.empty:
+                dp_m = self._daily_prod(u_m)
+                trend_m = "STABİL"
+                if len(dp_m) > 1:
+                    dp_m = dp_m.sort_values('date')
+                    yari_m = len(dp_m) // 2
+                    ilk_u = dp_m.head(max(yari_m, 1))['uretim'].mean()
+                    son_u = dp_m.tail(max(yari_m, 1))['uretim'].mean()
+                    if son_u > ilk_u * 1.1: trend_m = "ARTIYOR (İyileşme)"
+                    elif son_u < ilk_u * 0.9: trend_m = "AZALIYOR (İstikrarsızlık)"
+                    else: trend_m = "STABİL (İstikrarlı)"
+
+                ctx += f"[{isim} DETAYLI BİLGİ]\n"
+                ctx += f"Değerlendirilen Tarih Aralığı: {u_m['date'].min().strftime('%d.%m.%Y')} - {u_m['date'].max().strftime('%d.%m.%Y')}\n"
+                ctx += f"Toplam Üretim: {int(dp_m['uretim'].sum())} adet\nGünlük Ortalama: {int(dp_m['uretim'].mean())} adet/gün\nÜretim Trendi: {trend_m}\n"
+                
+                if 'personel' in u_m.columns:
+                    personeller_m = [str(p) for p in u_m['personel'].dropna().unique() if str(p).strip()]
+                    if personeller_m: ctx += f"Çalışan Operatör(ler): {', '.join(personeller_m)}\n"
+                        
+                ctx += f"Ort. Çevrim Süresi: {round(u_m['sure'].mean(), 1)} sn\n"
+                ort_mud = int(u_m['mudahale_suresi_sn'].mean()) if not u_m['mudahale_suresi_sn'].empty else 0
+                ctx += f"Ort. Alarmlara/Duruşlara Müdahale: {ort_mud} sn\n"
+                
+                import datetime as dt_lib
+                erken_bas_list, erken_bit_list = [], []
+                if 'start' in u_m.columns and 'stop' in u_m.columns:
+                    u_m_time = u_m.dropna(subset=['start', 'stop'])
+                    if not u_m_time.empty:
+                        min_idx = u_m_time.groupby('date')['start'].idxmin()
+                        max_idx = u_m_time.groupby('date')['stop'].idxmax()
+                        min_rows = u_m_time.loc[min_idx]
+                        max_rows = u_m_time.loc[max_idx]
+                        def get_daily_personel(d):
+                            day_data = u_m[u_m['date'] == d]['personel'].dropna()
+                            return str(day_data.mode()[0]) if not day_data.empty else "Bilinmiyor"
+                        for _, row in min_rows.iterrows():
+                            if row['start'].time() > dt_lib.time(8, 5):
+                                p = get_daily_personel(row['date'])
+                                erken_bas_list.append(f"{row['date'].strftime('%d.%m')}({p})")
+                        for _, row in max_rows.iterrows():
+                            if row['stop'].time() < dt_lib.time(16, 55):
+                                p = get_daily_personel(row['date'])
+                                erken_bit_list.append(f"{row['date'].strftime('%d.%m')}({p})")
+                bas_str = f" Detay: {', '.join(erken_bas_list)}" if erken_bas_list else ""
+                bit_str = f" Detay: {', '.join(erken_bit_list)}" if erken_bit_list else ""
+                ctx += f"Operatör Disiplini (08:05'ten Sonra İşe Başlama): {len(dp_m)} günün {len(erken_bas_list)} günü.{bas_str}\n"
+                ctx += f"Operatör Disiplini (16:55'ten Önce İşi Bırakma): {len(dp_m)} günün {len(erken_bit_list)} günü.{bit_str}\n"
+                ctx += f"Toplam Arıza: {len(a_m)}\n"
+                if not a_m.empty:
+                    af_m = a_m['aciklama'].value_counts().head(5)
+                    ctx += f"En Sık Arızaları: " + ", ".join([f"'{k}' ({v}x)" for k,v in af_m.items()]) + "\n"
+                
+                toplam_sn = u_m['mudahale_suresi_sn'].sum()
+                mak_sn = u_m[u_m['durus_tipi']=='Makine']['mudahale_suresi_sn'].sum()
+                op_sn = u_m[u_m['durus_tipi']=='Operatör']['mudahale_suresi_sn'].sum()
+                ort_cevrim = u_m['sure'].mean()
+                beklenen_uretim = int(toplam_sn / ort_cevrim) if ort_cevrim > 0 else 0
+                kayip = min(beklenen_uretim, int(dp_m['uretim'].sum()))
+                
+                ctx += f"Toplam Duruş Süresi: {int(toplam_sn/60)} dk\nMakine Kaynaklı Duruş: {int(mak_sn/60)} dk\nOperatör Kaynaklı Duruş: {int(op_sn/60)} dk\nTahmini Kayıp Üretim: {kayip} adet\n\n"
+        
+        if barcode:
+            mask = self.uretim['siparis_no'].astype(str).str.contains(barcode, na=False) | self.uretim['etiket'].astype(str).str.contains(barcode, na=False)
+            u_b = self.uretim[mask]
+            if not u_b.empty:
+                ctx += f"[SİPARİŞ / BARKOD DETAYI: {barcode}]\n"
+                if 'personel' in u_b.columns:
+                    personeller = u_b['personel'].dropna().unique()
+                    personel_str = ", ".join([str(p) for p in personeller if str(p).strip()])
+                else: personel_str = ""
+                if not personel_str: personel_str = "Kayıtlı personel yok"
+                
+                b_uretim = int(u_b['uretimadet'].sum())
+                b_1kalite = int(pd.to_numeric(u_b['birinci_kalite'], errors='coerce').fillna(0).sum()) if 'birinci_kalite' in u_b.columns else 0
+                b_2kalite = int(pd.to_numeric(u_b['ikinci_kalite'], errors='coerce').fillna(0).sum()) if 'ikinci_kalite' in u_b.columns else 0
+                b_tamir = int(pd.to_numeric(u_b['tamir'], errors='coerce').fillna(0).sum()) if 'tamir' in u_b.columns else 0
+                b_makineler = ", ".join([get_machine_name(m) for m in u_b['Makinekimlik'].unique()])
+                b_tarih_min = u_b['date'].min()
+                b_tarih_max = u_b['date'].max()
+                
+                p2_str = pt_str = ""
+                if 'personel' in u_b.columns and 'ikinci_kalite' in u_b.columns:
+                    u_b_kalite = u_b.copy()
+                    u_b_kalite['ikinci_kalite_num'] = pd.to_numeric(u_b_kalite['ikinci_kalite'], errors='coerce').fillna(0)
+                    u_b_kalite['tamir_num'] = pd.to_numeric(u_b_kalite['tamir'], errors='coerce').fillna(0)
+                    p2_counts = u_b_kalite.groupby('personel')['ikinci_kalite_num'].sum()
+                    p2_counts = p2_counts[p2_counts > 0].sort_values(ascending=False)
+                    if not p2_counts.empty: p2_str = "\n".join([f"  - {p}: {int(c)} adet" for p, c in p2_counts.items() if str(p).strip()])
+                    pt_counts = u_b_kalite.groupby('personel')['tamir_num'].sum()
+                    pt_counts = pt_counts[pt_counts > 0].sort_values(ascending=False)
+                    if not pt_counts.empty: pt_str = "\n".join([f"  - {p}: {int(c)} adet" for p, c in pt_counts.items() if str(p).strip()])
+
+                ctx += f"Üretildiği Makineler: {b_makineler}\nÜretim Tarih Aralığı: {b_tarih_min} ile {b_tarih_max}\nÇalışan Operatörler: {personel_str}\nToplam Üretim: {b_uretim} adet\n"
+                ctx += f"1. Kalite Ürün: {b_1kalite} adet\n2. Kalite Ürün: {b_2kalite} adet\n"
+                if p2_str: ctx += f"2. Kalite Ürünleri Üreten Operatörler:\n{p2_str}\n"
+                ctx += f"Tamir Edilen: {b_tamir} adet\n"
+                if pt_str: ctx += f"Tamir İşlemi Yapan Operatörler:\n{pt_str}\n"
+                ctx += "\n"
+            else:
+                ctx += f"[SİPARİŞ / BARKOD DETAYI: {barcode}]\nBu döneme ait '{barcode}' barkoduyla eşleşen hiçbir kayıt bulunamadı.\n\n"
+
+        return ctx
+
+    def _ask_llm(self, data_context, question, chat_history, route="GENEL"):
+        history_text = ""
+        if chat_history:
+            history_text = "<chat_history>\n"
+            for q, a in chat_history:
+                history_text += f"Kullanıcı: {q}\nAsistan: {a}\n\n"
+            history_text += "</chat_history>"
+
+        rules_text = ROUTE_RULES.get(route, ROUTE_RULES["GENEL"])
+        prompt = f"<system_role>\n{SYSTEM_IDENTITY}\n</system_role>\n<rules>\n{rules_text}\n</rules>\n<data_context>\n{data_context}\n</data_context>\n{history_text}\n<user_question>\n{question}\n</user_question>\nCevabını yalnızca düz metin olarak ver:"
+        
+        try:
+            resp = http_requests.post(OLLAMA_URL, json={
+                "model": "llama3.1", "prompt": prompt, "stream": False,
+                "options": {"temperature": 0.0, "top_p": 0.1}
+            }, timeout=240)
+            if resp.status_code == 200:
+                answer = resp.json().get('response', '').strip()
+                if answer: return answer
+        except Exception as e: print(f"⚠️ LLM hatası: {e}")
+        return f"Şu an zeka modelim kapalı. Ancak sorduğunuz dönemin verileri şu şekilde:\n\n{data_context}"
+
+    def _semantic_route(self, msg):
+        m = msg.lower()
+        sohbet_keys = ["merhaba", "selam", "nasılsın", "teşekkür", "sağ ol", "günaydın", "iyi günler", "hoşça kal", "görüşürüz"]
+        veri_keys = ["üretim", "arıza", "alarm", "makine", "sipariş", "performans", "operatör", "kalite", "tamir", "duruş", "adet", "rapor", "koptu"]
+        if any(k in m for k in sohbet_keys) and not any(k in m for k in veri_keys): return ("ODAKLI", "SOHBET")
+        
+        kapsamli_keys = ["rapor", "özet", "genel performans", "genel durum", "nasıldır", "nasıldı", "değerlendir", "analiz et", "enler", "en'ler", "kapsayan", "tüm veriler", "genel olarak"]
+        domain_hits = sum([
+            any(k in m for k in ["üretim", "adet", "verimli", "en iyi makine", "en kötü makine"]),
+            any(k in m for k in ["alarm", "arıza", "duruş", "hata", "koptu"]),
+            any(k in m for k in ["sipariş", "barkod", "ürün"]),
+            any(k in m for k in ["operatör", "personel", "kalite", "tamir"]),
+        ])
+        if any(k in m for k in kapsamli_keys) or domain_hits >= 2: return ("KAPSAMLI", "GENEL")
+        
+        if self._resolve_barcode(msg): return ("ODAKLI", "SIPARIS")
+        siparis_keys = ["sipariş", "barkod", "ürün", "etiket"]
+        if any(k in m for k in siparis_keys): return ("ODAKLI", "SIPARIS")
+        
+        ariza_keys = ["alarm", "arıza", "koptu", "kopma", "sensör", "duruş", "hata", "rezerve", "buton", "kolon", "pause", "gripper", "çözüm", "tavsiye", "ip koptu", "ip takıldı"]
+        if any(k in m for k in ariza_keys): return ("ODAKLI", "ARIZA")
+        
+        personel_keys = ["operatör", "personel", "kalite", "tamir", "kim yaptı", "kim üret", "hangi işçi", "geç başla", "erken bırak", "disiplin"]
+        if any(k in m for k in personel_keys): return ("ODAKLI", "PERSONEL")
+        
+        if self._resolve_machines(msg): return ("ODAKLI", "MAKINE")
+        
+        devam_keys = ["bu alarm", "bu arıza", "bu makine", "bu sipariş", "hangi makinede", "hangi makinada", "hangisinde", "kaç defa", "kaç kez", "ne kadar", "peki"]
+        if any(k in m for k in devam_keys) and self._last_route: return ("ODAKLI", self._last_route)
+        
+        return ("KAPSAMLI", "GENEL")
+
+    def _slice_context(self, full_context, keep_sections, period_text="Seçilen Dönem"):
+        result = f"=== VERİ BAĞLAMI ===\nAnaliz Dönemi: {period_text}\n\n"
+        for section_name in keep_sections:
+            if section_name in full_context:
+                start = full_context.index(section_name)
+                all_section_markers = ["[GENEL ÜRETİM]", "[GÜNLÜK ÜRETİM VE ARIZA ÖZETİ]", "[MAKİNE BAZLI ÜRETİM (Sıralı)]", "[ARIZA / ALARM BİLGİLERİ]", "[DURUŞ ANALİZİ", "[ARIZA TRENDİ]", "[PERSONEL / OPERATÖR PERFORMANSI]"]
+                for mid in MACHINE_NAME_MAP.values(): all_section_markers.append(f"[{mid} DETAYLI BİLGİ]")
+                all_section_markers.append("[SİPARİŞ / BARKOD DETAYI:")
+                
+                next_starts = [full_context.index(m) for m in all_section_markers if m in full_context and full_context.index(m) > start]
+                end = min(next_starts) if next_starts else len(full_context)
+                result += full_context[start:end]
+        return result.strip()
+
+    def _build_ariza_context(self, full_context, period_text):
+        return self._slice_context(full_context, ["[ARIZA / ALARM BİLGİLERİ]", "[DURUŞ ANALİZİ", "[ARIZA TRENDİ]"], period_text)
+    
+    def _build_siparis_context(self, full_context, barcode, period_text):
+        marker = f"[SİPARİŞ / BARKOD DETAYI: {barcode}]"
+        if marker in full_context:
+            section = full_context[full_context.index(marker):]
+            return f"=== VERİ BAĞLAMI ===\nSorgu: Sipariş/Barkod '{barcode}' detayları\n\n{section}"
+        return f"=== VERİ BAĞLAMI ===\n'{barcode}' barkoduyla eşleşen kayıt bulunamadı."
+    
+    def _build_makine_context(self, full_context, makine_id, period_text):
+        isim = get_machine_name(makine_id)
+        machine_marker = f"[{isim} DETAYLI BİLGİ]"
+        result = self._slice_context(full_context, ["[GENEL ÜRETİM]", "[MAKİNE BAZLI ÜRETİM (Sıralı)]", "[ARIZA / ALARM BİLGİLERİ]"], period_text)
+        if machine_marker in full_context:
+            start = full_context.index(machine_marker)
+            next_markers = ["[SİPARİŞ / BARKOD DETAYI:"]
+            for mid in MACHINE_NAME_MAP.values():
+                if mid != isim: next_markers.append(f"[{mid} DETAYLI BİLGİ]")
+            next_starts = [full_context.index(m) for m in next_markers if m in full_context and full_context.index(m) > start]
+            end = min(next_starts) if next_starts else len(full_context)
+            result += "\n" + full_context[start:end]
+        return result.strip()
+    
+    def _build_personel_context(self, full_context, makine_id, period_text):
+        sections = ["[PERSONEL / OPERATÖR PERFORMANSI]"]
+        if makine_id: sections.append(f"[{get_machine_name(makine_id)} DETAYLI BİLGİ]")
+        return self._slice_context(full_context, sections, period_text)
+
+    def process_message(self, msg):
+        self._ensure_fresh()
+        if self.uretim is None or self.ariza is None or self.uretim.empty: return "⚠️ Veri dosyaları yüklenemedi."
+        
+        try:
+            mod, route = self._semantic_route(msg)
+            print(f"🔀 Semantic Route: {mod} → {route}")
+            
+            period = self._resolve_period(msg)
+            regex_makineler = self._resolve_machines(msg)
+            regex_makine = regex_makineler[0] if regex_makineler else None
+            regex_barkod = self._resolve_barcode(msg)
+            
+            makine_id = regex_makine or self._last_machine
+            barcode = regex_barkod or (self._last_barcode if route == "SIPARIS" else None)
+            
+            is_siparis_sorusu = bool(re.search(r'\b(sipariş|barkod|ürün)\b', msg.lower()))
+            if regex_makine and not is_siparis_sorusu: barcode = None
+            
+            if route == "SOHBET":
+                data_context = "Kullanıcı sadece sohbet ediyor veya selam veriyor. Kısa ve nazikçe cevap ver, veriye girmene gerek yok."
+                answer = self._ask_llm(data_context, msg, self._chat_history, route)
+                self._chat_history.append((msg, answer))
+                if len(self._chat_history) > 2: self._chat_history.pop(0)
+                return answer
+            
+            full_context = self._build_data_context(period, makine_id, barcode)
+            period_text = self._get_period_text(period)
+            
+            if mod == "ODAKLI":
+                if route == "ARIZA": llm_context = self._build_ariza_context(full_context, period_text)
+                elif route == "SIPARIS" and barcode: llm_context = self._build_siparis_context(full_context, barcode, period_text)
+                elif route == "MAKINE" and makine_id: llm_context = self._build_makine_context(full_context, makine_id, period_text)
+                elif route == "PERSONEL": llm_context = self._build_personel_context(full_context, makine_id, period_text)
+                else:
+                    llm_context = full_context
+                    route = "GENEL"
+            else:
+                llm_context = full_context
+                route = "GENEL"
+            
+            answer = self._ask_llm(llm_context, msg, self._chat_history, route)
+            
+            if makine_id: self._last_machine = makine_id
+            if barcode: self._last_barcode = barcode
+            self._last_period = period
+            self._last_route = route
+            
+            self._chat_history.append((msg, answer))
+            if len(self._chat_history) > 2: self._chat_history.pop(0)
+            
+            return answer
+            
+        except Exception as e:
+            traceback.print_exc()
+            return f"⚠️ İşlenirken hata: {str(e)}\n"
+
+chatbot_engine = ChatbotEngine()
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Akıllı Fabrika Yapay Zeka Rapor Arşivi</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='fonts/fonts.css') }}">
+    <style>
+        :root { --bg-dark: #020617; --cobalt: #0f172a; --cyan: #06b6d4; --cyan-glow: rgba(6, 182, 212, 0.5); --magenta: #d946ef; --magenta-glow: rgba(217, 70, 239, 0.5); --text-main: #f8fafc; --text-dim: #94a3b8; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: radial-gradient(circle at 30% 70%, #334155 0%, #0f172a 100%); color: var(--text-main); font-family: 'Inter', sans-serif; height: 100vh; overflow: hidden; }
+        .space-void { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; pointer-events: none; overflow: hidden; }
+        .particle { position: absolute; border-radius: 50%; filter: blur(5px); opacity: 0.5; animation: drift 20s infinite linear; }
+        .p1 { width: 120px; height: 120px; background: rgba(6,182,212,0.1); top: 10%; left: 15%; animation-duration: 25s; }
+        .p2 { width: 200px; height: 200px; background: rgba(217,70,239,0.08); top: 50%; left: 60%; animation-duration: 30s; animation-direction: reverse; }
+        .p3 { width: 80px; height: 80px; background: rgba(59,130,246,0.15); top: 80%; left: 20%; animation-duration: 18s; }
+        .data-stream { position: absolute; width: 2px; height: 150px; background: linear-gradient(to bottom, transparent, var(--cyan), transparent); opacity: 0.3; animation: stream 4s infinite linear; }
+        @keyframes drift { 0% { transform: translate(0,0) rotate(0deg); } 100% { transform: translate(-100px, -150px) rotate(360deg); } }
+        @keyframes stream { 0% { transform: translateY(-200px); opacity: 0; } 50% { opacity: 0.5; } 100% { transform: translateY(100vh); opacity: 0; } }
+        .dashboard { display: flex; gap: 40px; height: 100vh; padding: 40px; position: relative; z-index: 10; max-width: 1600px; margin: 0 auto; }
+        .unanchored { animation: float 6s ease-in-out infinite; }
+        .delay-1 { animation-delay: 0.5s; } .delay-2 { animation-delay: 1.0s; } .delay-3 { animation-delay: 1.5s; }
+        @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
+        .reports-module { flex: 1; display: flex; flex-direction: column; gap: 30px; overflow-y: auto; padding-right: 15px; }
+        .reports-module::-webkit-scrollbar { width: 0; }
+        .header-banner { background: rgba(30, 41, 59, 0.5); backdrop-filter: blur(20px); border: 1px solid rgba(6,182,212,0.2); border-radius: 24px; padding: 24px 30px; display: flex; align-items: center; gap: 24px; box-shadow: 0 10px 40px rgba(0,0,0,0.5), inset 0 0 20px rgba(6,182,212,0.05); }
+        .header-icon { color: var(--cyan); width: 48px; height: 48px; filter: drop-shadow(0 0 10px var(--cyan-glow)); }
+        .header-text h1 { font-family: 'Orbitron', sans-serif; font-size: 26px; margin: 0; color: #fff; text-shadow: 0 0 15px var(--cyan-glow); letter-spacing: 1px; }
+        .header-text p { margin: 6px 0 0; color: var(--cyan); font-size: 14px; font-weight: 500; }
+        .year-title { font-family: 'Orbitron', sans-serif; font-size: 20px; color: #fff; margin: 10px 0 0 10px; text-shadow: 0 0 10px rgba(255,255,255,0.3); }
+        .month-details { margin-bottom: 20px; }
+        .month-title { font-family: 'Orbitron', sans-serif; font-size: 18px; color: var(--cyan); margin: 16px 0; padding: 12px 20px; background: rgba(30, 41, 59, 0.5); border: 1px solid rgba(6,182,212,0.3); border-radius: 12px; cursor: pointer; text-shadow: 0 0 10px rgba(6,182,212,0.4); display: flex; align-items: center; transition: 0.3s; list-style: none; }
+        .month-title::-webkit-details-marker { display: none; }
+        .month-title:hover { background: rgba(6,182,212,0.15); box-shadow: 0 0 15px rgba(6,182,212,0.2); }
+        .month-title::before { content: '📁'; margin-right: 10px; filter: drop-shadow(0 0 5px var(--cyan-glow)); }
+        .month-details[open] .month-title { border-bottom-left-radius: 0; border-bottom-right-radius: 0; border-bottom: none; }
+        .month-details[open] .month-title::before { content: '📂'; }
+        .month-content { padding-left: 20px; padding-top: 16px; border-left: 2px dashed rgba(6,182,212,0.3); margin-left: 20px; }
+        .capsule { background: rgba(30, 41, 59, 0.6); backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.05); border-left: 4px solid var(--cyan); border-radius: 50px; padding: 16px 24px; display: flex; align-items: center; gap: 20px; transition: 0.3s; margin-bottom: 16px; }
+        .capsule:hover { background: rgba(6,182,212,0.1); box-shadow: 0 8px 30px rgba(6,182,212,0.15); transform: translateX(8px); }
+        .capsule-icon { color: var(--cyan); width: 36px; height: 36px; flex-shrink: 0; }
+        .capsule-info { flex: 1; }
+        .capsule-info h3 { margin: 0; font-size: 18px; color: #fff; }
+        .capsule-info p { margin: 4px 0 0; font-size: 13px; color: var(--text-dim); }
+        .capsule-action { background: rgba(6,182,212,0.1); color: var(--cyan); border: 1px solid var(--cyan); padding: 10px 24px; border-radius: 30px; text-decoration: none; font-weight: 600; transition: 0.3s; box-shadow: 0 0 10px rgba(6,182,212,0.1); }
+        .capsule-action:hover { background: var(--cyan); color: #000; box-shadow: 0 0 20px var(--cyan-glow); }
+        .empty-state { text-align: center; padding: 40px; color: var(--text-dim); background: rgba(255,255,255,0.02); border-radius: 20px; border: 1px dashed rgba(255,255,255,0.1); }
+        .ai-sidebar { width: 440px; background: rgba(30, 41, 59, 0.3); backdrop-filter: blur(25px); border: 1px solid rgba(217, 70, 239, 0.2); border-radius: 30px; display: flex; flex-direction: column; padding: 24px; box-shadow: 0 20px 60px rgba(217, 70, 239, 0.1), inset 0 0 40px rgba(217, 70, 239, 0.05); position: relative; }
+        .sidebar-header { display: flex; align-items: center; gap: 16px; padding-bottom: 20px; border-bottom: 1px solid rgba(255,255,255,0.05); margin-bottom: 20px; }
+        .ai-robot-icon { width: 54px; height: 54px; color: var(--magenta); filter: drop-shadow(0 0 15px var(--magenta-glow)); }
+        .sidebar-header h2 { font-family: 'Orbitron', sans-serif; font-size: 22px; margin: 0; color: #fff; text-shadow: 0 0 15px var(--magenta-glow); }
+        .chat-body { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; padding-right: 8px; }
+        .chat-body::-webkit-scrollbar { width: 4px; }
+        .chat-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+        .quick-actions { display: flex; flex-direction: column; gap: 12px; margin: 20px 0; }
+        .action-btn { background: rgba(217, 70, 239, 0.05); border: 1px solid rgba(217, 70, 239, 0.3); color: #fdf4ff; padding: 14px 18px; border-radius: 16px; cursor: pointer; font-family: 'Inter', sans-serif; font-size: 14px; transition: 0.3s; text-align: left; display: flex; align-items: center; gap: 10px; }
+        .action-btn::before { content: '✨'; font-size: 14px; }
+        .action-btn:hover { background: rgba(217, 70, 239, 0.2); box-shadow: 0 0 20px rgba(217, 70, 239, 0.2); transform: translateX(6px); border-color: var(--magenta); }
+        .input-pane { display: flex; gap: 12px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1); border-radius: 24px; padding: 8px; box-shadow: inset 0 2px 10px rgba(0,0,0,0.5); }
+        #chat-input { flex: 1; background: transparent; border: none; outline: none; color: #fff; padding: 0 16px; font-family: 'Inter', sans-serif; font-size: 15px; }
+        #chat-input::placeholder { color: rgba(255,255,255,0.3); }
+        #send-btn { width: 48px; height: 48px; border-radius: 18px; background: linear-gradient(135deg, var(--cyan), var(--magenta)); border: none; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: 0.3s; box-shadow: 0 4px 15px rgba(217, 70, 239, 0.3); }
+        #send-btn:hover { transform: scale(1.05); box-shadow: 0 6px 25px rgba(217, 70, 239, 0.5); }
+        #send-btn:disabled { filter: grayscale(1); opacity: 0.5; transform: none; cursor: not-allowed; }
+        #send-btn svg { width: 22px; height: 22px; }
+        .msg { display: flex; gap: 14px; animation: slideIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+        .msg.user { flex-direction: row-reverse; }
+        @keyframes slideIn { from { opacity: 0; transform: translateY(15px); } to { opacity: 1; transform: translateY(0); } }
+        .avatar { width: 40px; height: 40px; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); }
+        .msg.bot .avatar { color: var(--magenta); text-shadow: 0 0 10px var(--magenta-glow); box-shadow: inset 0 0 15px rgba(217,70,239,0.2); }
+        .msg.user .avatar { color: var(--cyan); text-shadow: 0 0 10px var(--cyan-glow); box-shadow: inset 0 0 15px rgba(6,182,212,0.2); }
+        .bubble { background: rgba(255,255,255,0.03); backdrop-filter: blur(10px); padding: 16px 20px; border-radius: 20px; font-size: 14.5px; line-height: 1.6; color: #f1f5f9; border: 1px solid rgba(255,255,255,0.05); white-space: pre-wrap; }
+        .msg.bot .bubble { border-top-left-radius: 4px; border-left: 2px solid var(--magenta); }
+        .msg.user .bubble { border-top-right-radius: 4px; border-right: 2px solid var(--cyan); background: rgba(6,182,212,0.05); }
+        .time { font-size: 11px; color: rgba(255,255,255,0.3); margin-top: 8px; }
+        .msg.user .time { text-align: right; }
+        .typing { display: flex; gap: 6px; padding: 8px; }
+        .typing span { width: 8px; height: 8px; background: var(--magenta); border-radius: 50%; animation: blink 1.4s infinite; opacity: 0.3; }
+        .typing span:nth-child(2) { animation-delay: 0.2s; } .typing span:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes blink { 0%, 100% { transform: scale(0.8); opacity: 0.3; } 50% { transform: scale(1.2); opacity: 1; box-shadow: 0 0 10px var(--magenta); } }
+    </style>
+</head>
+<body>
+    <div class="space-void">
+        <div class="particle p1"></div><div class="particle p2"></div><div class="particle p3"></div>
+        <div class="data-stream" style="left: 10%; animation-delay: 0s;"></div>
+        <div class="data-stream" style="left: 40%; animation-delay: 2s;"></div>
+        <div class="data-stream" style="left: 80%; animation-delay: 1s;"></div>
+    </div>
+
+    <div class="dashboard">
+        <main class="reports-module">
+            <header class="header-banner unanchored">
+                <div class="header-icon">
+                    <svg viewBox="0 0 24 24"><path fill="currentColor" d="M19,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5C21,3.89 20.1,3 19,3M19,19H5V5H19V19M17,17H7V15H17V17M17,13H7V11H17V13M17,9H7V7H17V9Z" /></svg>
+                </div>
+                <div class="header-text">
+                    <h1>Yapay Zeka Rapor Arşivi</h1>
+                    <p>Geçmişe dönük tüm kestirimci bakım ve üretim raporları</p>
+                </div>
+            </header>
+
+            {% if grouped_files %}
+                {% for year, months in grouped_files.items() %}
+                    <div class="year-title unanchored delay-1">{{ year }} Yılı Raporları</div>
+                    {% for month, days in months.items() %}
+                        <details class="month-details unanchored delay-2">
+                            <summary class="month-title">{{ month }}</summary>
+                            <div class="month-content">
+                            {% for day, files in days.items() %}
+                                {% for dosya in files %}
+                                <div class="capsule">
+                                    <div class="capsule-icon">
+                                        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20,6H12L10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6M20,18H4V8H20V18Z"/></svg>
+                                    </div>
+                                    <div class="capsule-info">
+                                        <h3>{{ day }} {{ month }} Raporu</h3>
+                                        <p>Dosya: {{ dosya }}</p>
+                                    </div>
+                                    <a class="capsule-action" href="{{ url_for('indir', filename=dosya) }}" target="_blank">Aç</a>
+                                </div>
+                                {% endfor %}
+                            {% endfor %}
+                            </div>
+                        </details>
+                    {% endfor %}
+                {% endfor %}
+            {% else %}
+                <div class="empty-state unanchored">
+                    <p>Uzay boşluğunda henüz oluşturulmuş bir rapor bulunmamaktadır...</p>
+                </div>
+            {% endif %}
+        </main>
+
+        <aside class="ai-sidebar unanchored delay-2">
+            <div class="sidebar-header">
+                <div class="ai-robot-icon">
+                    <svg viewBox="0 0 24 24"><path fill="currentColor" d="M21 11.5v-1c0-.83-.67-1.5-1.5-1.5H18V7c0-1.1-.9-2-2-2h-3V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V5H7c-1.1 0-2 .9-2 2v2H3.5C2.67 9 2 9.67 2 10.5v1c0 .83.67 1.5 1.5 1.5H5v4c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2v-4h1.5c.83 0 1.5-.67 1.5-1.5zM16 17H8V7h8v10zm-6-5.5c0-.83-.67-1.5-1.5-1.5S7 10.67 7 11.5s.67 1.5 1.5 1.5 1.5-.67 1.5-1.5zm5.5 1.5c.83 0 1.5-.67 1.5-1.5s-.67-1.5-1.5-1.5-1.5.67-1.5 1.5.67 1.5 1.5 1.5z"/></svg>
+                </div>
+                <h2>AI Asistanı</h2>
+            </div>
+            <div class="chat-body" id="chat-body"></div>
+            <div class="quick-actions">
+                <button class="action-btn unanchored delay-1" onclick="askSuggestion(this)">Akıllı Özet İste</button>
+                <button class="action-btn unanchored delay-2" onclick="askSuggestion(this)">Tahmine Dayalı Analiz Sorgula</button>
+                <button class="action-btn unanchored delay-3" onclick="askSuggestion(this)">Kritik Raporları Listele</button>
+            </div>
+            <div class="input-pane unanchored delay-1">
+                <input type="text" id="chat-input" placeholder="Asistan'a Sor..." autocomplete="off">
+                <button id="send-btn" onclick="sendMessage()">
+                    <svg viewBox="0 0 24 24"><path fill="currentColor" d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+                </button>
+            </div>
+        </aside>
+    </div>
+
+    <script>
+    const chatBody = document.getElementById('chat-body');
+    const chatInput = document.getElementById('chat-input');
+    const sendBtn = document.getElementById('send-btn');
+    let isWaiting = false;
+
+    window.onload = () => {
+        addBotMessage(`Merhaba! Akıllı Fabrika üretim ve performans paneline hoş geldiniz. Verilerinizi tarıyor ve kestirimci analizler sunuyorum.\n\nNasıl yardımcı olabilirim?`);
+    };
+
+    function now() { return new Date().toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' }); }
+
+    function addBotMessage(text) {
+        const div = document.createElement('div');
+        div.className = 'msg bot';
+        div.innerHTML = '<div class="avatar">🤖</div><div><div class="bubble">' +
+            escapeHtml(text) + '</div><div class="time">' + now() + '</div></div>';
+        chatBody.appendChild(div);
+        chatBody.scrollTop = chatBody.scrollHeight;
+    }
+
+    function addUserMessage(text) {
+        const div = document.createElement('div');
+        div.className = 'msg user';
+        div.innerHTML = '<div class="avatar">👤</div><div><div class="bubble">' +
+            escapeHtml(text) + '</div><div class="time">' + now() + '</div></div>';
+        chatBody.appendChild(div);
+        chatBody.scrollTop = chatBody.scrollHeight;
+    }
+
+    function showTyping() {
+        const div = document.createElement('div');
+        div.className = 'msg bot typing-msg';
+        div.innerHTML = '<div class="avatar">🤖</div><div class="bubble typing"><span></span><span></span><span></span></div>';
+        chatBody.appendChild(div);
+        chatBody.scrollTop = chatBody.scrollHeight;
+    }
+
+    function hideTyping() {
+        const t = document.querySelector('.typing-msg');
+        if(t) t.remove();
+    }
+
+    async function sendMessage() {
+        const text = chatInput.value.trim();
+        if (!text || isWaiting) return;
+
+        addUserMessage(text);
+        chatInput.value = '';
+        isWaiting = true;
+        sendBtn.disabled = true;
+        showTyping();
+
+        try {
+            const res = await fetch('/api/chat', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ message: text })
+            });
+            const data = await res.json();
+            hideTyping();
+            addBotMessage(data.response);
+        } catch (err) {
+            hideTyping();
+            addBotMessage("Sinyal koptu... İletişim kurulamıyor.");
+        } finally {
+            isWaiting = false;
+            sendBtn.disabled = false;
+            chatInput.focus();
+        }
+    }
+
+    function askSuggestion(btn) {
+        const text = btn.innerText.replace('✨ ', '').trim();
+        const map = {
+            'Akıllı Özet İste': 'Son bir haftanın atölye performansını özetler misin?',
+            'Tahmine Dayalı Analiz Sorgula': 'Arıza trendi nasıl?',
+            'Kritik Raporları Listele': 'Sistemdeki en kötü performanslı makine hangisidir?'
+        };
+        chatInput.value = map[text] || text;
+        sendMessage();
+    }
+
+    chatInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') sendMessage();
+    });
+
+    function escapeHtml(unsafe) {
+        return unsafe
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+    </script>
+</body>
+</html>
+"""
+
+# ==========================================================
+# FLASK ROUTE'LARI
+# ==========================================================
+@app.route('/')
+def index():
+    if not os.path.exists(RAPOR_KLASORU):
+        os.makedirs(RAPOR_KLASORU)
+
+    dosyalar = [f for f in os.listdir(RAPOR_KLASORU) if f.endswith('.pdf')]
+    dosyalar_with_time = []
+    for f in dosyalar:
+        fp = os.path.join(RAPOR_KLASORU, f)
+        dosyalar_with_time.append((f, os.path.getmtime(fp)))
+    dosyalar_with_time.sort(key=lambda x: x[1], reverse=True)
+
+    aylar_tr = {
+        1: "Ocak", 2: "Şubat", 3: "Mart", 4: "Nisan",
+        5: "Mayıs", 6: "Haziran", 7: "Temmuz", 8: "Ağustos",
+        9: "Eylül", 10: "Ekim", 11: "Kasım", 12: "Aralık"
+    }
+
+    grouped_files = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for f, mtime in dosyalar_with_time:
+        dt = datetime.fromtimestamp(mtime)
+        grouped_files[dt.year][aylar_tr[dt.month]][dt.day].append(f)
+
+    return render_template_string(HTML_TEMPLATE, grouped_files=grouped_files)
+
+@app.route('/download/<filename>')
+def indir(filename):
+    return send_from_directory(RAPOR_KLASORU, filename)
+
+@app.route('/api/chat', methods=['POST'])
+def chat_api():
+    client_ip = request.remote_addr
+    data = request.get_json()
+    msg = data.get('message', '').strip()
+    if not msg:
+        return jsonify({"response": "Lütfen bir soru yazın."})
+    
+    response = chatbot_engine.process_message(msg)
+    
+    print(f"\n{'='*50}")
+    print(f"🌍 İstek Yapan IP: {client_ip}")
+    print(f"👤 Gelen Soru    : {msg}")
+    print(f"🤖 LLM Cevabı    : {response}")
+    print(f"{'='*50}\n")
+    
+    return jsonify({"response": response})
+
+# ==========================================================
+# UYGULAMA BAŞLATMA
+# ==========================================================
+if __name__ == '__main__':
+    print("=" * 60)
+    print("🧪 [DENEME] Hibrit Intent — AI Rapor Arşivi Başlatılıyor...")
+    
+    # Uygulama başlamadan önce SQL'den canlı verileri çekmeye çalış
+    bugun_str = datetime.now().strftime('%Y-%m-%d')
+    fetch_data_from_sql_to_excel(URETIM_EXCEL, ARIZA_EXCEL, bugun_str)
+    
+    print("📊 Rapor arşivi: http://localhost:8080")
+    print("🤖 AI Chatbot: Sağ alt köşedeki baloncuğa tıklayın")
+    print("=" * 60)
+    app.run(host='0.0.0.0', port=8080, debug=False)
