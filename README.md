@@ -1,4 +1,4 @@
-# -End-striyel-Yapay-Zeka-Asistan-
+# -Endustriyel-Yapay-Zeka-Asistani-
 Genel Amaçlı Endüstriyel Yapay Zeka Asistanı
 # 🏭 Endüstriyel Yapay Zeka Asistanı & RAG-Lite Analitik Platformu
 
